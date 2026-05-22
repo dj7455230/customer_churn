@@ -6,6 +6,27 @@ import warnings
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+import shap
+import io
+import base64
+import hashlib
+import json
+import re
+import time
+import random
+import tempfile
+import os
+from datetime import datetime, timedelta
+from gtts import gTTS
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors as rl_colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                 Table, TableStyle, HRFlowable)
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 
@@ -16,7 +37,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
 # ─── Premium CSS with Glassmorphism + Animations ────────────────────────────────
 st.markdown("""
 <style>
@@ -288,8 +308,79 @@ st.markdown("""
   ::-webkit-scrollbar-track { background: #0f0f1a; }
   ::-webkit-scrollbar-thumb { background: #2d2b45; border-radius: 3px; }
   ::-webkit-scrollbar-thumb:hover { background: #7c3aed; }
+
+  /* ── Login Card ── */
+  .login-wrap {
+    max-width: 420px; margin: 4rem auto;
+    background: rgba(19,17,31,0.85);
+    border: 1px solid rgba(124,58,237,0.35);
+    border-radius: 24px; padding: 2.5rem 2.8rem;
+    backdrop-filter: blur(20px);
+    box-shadow: 0 30px 60px rgba(0,0,0,0.5), 0 0 40px rgba(124,58,237,0.1);
+  }
+  .login-title {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 1.8rem; font-weight: 700; text-align: center;
+    background: linear-gradient(135deg, #a78bfa, #22d3ee);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text; margin-bottom: .4rem;
+  }
+  .login-sub { text-align: center; color: #9d9abf; font-size: .88rem; margin-bottom: 1.8rem; }
+
+  /* ── Segment Cards ── */
+  .seg-card {
+    border-radius: 14px; padding: 1.2rem 1.4rem;
+    border: 1px solid; margin-bottom: .5rem;
+    transition: transform .2s;
+  }
+  .seg-card:hover { transform: translateY(-2px); }
+  .seg-title { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1rem; }
+  .seg-desc  { font-size: .82rem; color: #9d9abf; margin-top: .3rem; line-height: 1.5; }
+
+  /* ── Why Churn Section ── */
+  .why-card {
+    background: rgba(19,17,31,0.6);
+    border-radius: 14px; padding: 1.3rem 1.5rem;
+    border-left: 4px solid;
+    margin-bottom: .8rem;
+    transition: all .2s;
+  }
+  .why-card:hover { transform: translateX(4px); }
+  .why-title { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: .95rem; margin-bottom: .4rem; }
+  .why-desc  { font-size: .83rem; color: #9d9abf; line-height: 1.6; }
+
+  /* ── Sim pulse ── */
+  @keyframes pulse-dot {
+    0%,100% { opacity:1; transform:scale(1); }
+    50%      { opacity:.5; transform:scale(1.4); }
+  }
+  .live-dot {
+    display:inline-block; width:8px; height:8px;
+    background:#34d399; border-radius:50%;
+    animation: pulse-dot 1.5s ease-in-out infinite;
+    margin-right:6px;
+  }
+
+  /* ── Alert badge ── */
+  .alert-item {
+    display:flex; align-items:flex-start; gap:.8rem;
+    background:rgba(248,113,113,0.07);
+    border:1px solid rgba(248,113,113,0.2);
+    border-radius:10px; padding:.8rem 1rem; margin-bottom:.5rem;
+  }
+  .alert-icon { font-size:1.2rem; flex-shrink:0; }
+  .alert-body { font-size:.84rem; color:#d4d0f0; line-height:1.5; }
+  .alert-time { font-size:.72rem; color:#9d9abf; margin-top:.2rem; }
 </style>
 """, unsafe_allow_html=True)
+
+# ─── Session State Init ──────────────────────────────────────────────────────────
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+if "username" not in st.session_state:
+    st.session_state["username"] = ""
+if "run_prediction" not in st.session_state:
+    st.session_state["run_prediction"] = True
 
 
 # ─── Load Assets ────────────────────────────────────────────────────────────────
@@ -714,6 +805,587 @@ def monthly_violin():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#                         NEW FEATURE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─── SHAP Explainability ────────────────────────────────────────────────────────
+@st.cache_resource
+def get_shap_explainer(_model, _X_background):
+    """Build a LinearExplainer once and cache it."""
+    return shap.LinearExplainer(_model, _X_background, feature_perturbation="interventional")
+
+def shap_chart(X_row: pd.DataFrame, X_background: pd.DataFrame):
+    explainer   = get_shap_explainer(model, X_background)
+    shap_values = explainer.shap_values(X_row)[0]          # shape (n_features,)
+
+    # Top 15 by absolute value
+    top_idx  = np.argsort(np.abs(shap_values))[-15:]
+    names    = [FEATURE_COLS[i].replace("_", " ") for i in top_idx]
+    vals     = [shap_values[i] for i in top_idx]
+    base_val = explainer.expected_value
+
+    colors = ["#f87171" if v > 0 else "#22d3ee" for v in vals]
+
+    fig = go.Figure()
+
+    # Waterfall-style bars
+    fig.add_trace(go.Bar(
+        x=vals, y=names, orientation="h",
+        marker=dict(
+            color=colors,
+            line=dict(color="rgba(255,255,255,0.05)", width=0.5),
+        ),
+        hovertemplate="<b>%{y}</b><br>SHAP value: %{x:.4f}<extra></extra>",
+        name="SHAP Impact",
+    ))
+
+    # Base value line
+    fig.add_vline(x=base_val, line_dash="dash",
+                  line_color="rgba(167,139,250,0.6)", line_width=1.5,
+                  annotation_text=f"Base: {base_val:.3f}",
+                  annotation_font_color="#a78bfa",
+                  annotation_font_size=10)
+
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#9d9abf", "family": "Inter"},
+        xaxis=dict(gridcolor="rgba(45,43,69,0.5)", zerolinecolor="#a78bfa",
+                   title="SHAP Value (impact on model output)"),
+        yaxis=dict(gridcolor="rgba(0,0,0,0)"),
+        margin=dict(t=10, b=10, l=10, r=20), height=420,
+        showlegend=False,
+    )
+    return fig, shap_values
+
+
+# ─── PDF Report Generator ───────────────────────────────────────────────────────
+def generate_pdf_report(inputs: dict, prob: float, pred: int,
+                         risk_factors: list, prot_factors: list,
+                         advice: list, shap_vals: np.ndarray) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                             leftMargin=2*cm, rightMargin=2*cm,
+                             topMargin=2*cm, bottomMargin=2*cm)
+
+    styles = getSampleStyleSheet()
+    # Custom styles
+    title_style = ParagraphStyle("title", parent=styles["Title"],
+                                  fontSize=22, textColor=rl_colors.HexColor("#a78bfa"),
+                                  spaceAfter=4, fontName="Helvetica-Bold")
+    sub_style   = ParagraphStyle("sub", parent=styles["Normal"],
+                                  fontSize=10, textColor=rl_colors.HexColor("#9d9abf"),
+                                  spaceAfter=12)
+    h2_style    = ParagraphStyle("h2", parent=styles["Heading2"],
+                                  fontSize=13, textColor=rl_colors.HexColor("#22d3ee"),
+                                  spaceBefore=14, spaceAfter=6, fontName="Helvetica-Bold")
+    body_style  = ParagraphStyle("body", parent=styles["Normal"],
+                                  fontSize=10, textColor=rl_colors.HexColor("#1a1a2e"),
+                                  spaceAfter=4, leading=14)
+    risk_color  = "#f87171" if pred == 1 else "#34d399"
+    result_txt  = "⚠ CHURN RISK DETECTED" if pred == 1 else "✓ LOW CHURN RISK"
+
+    story = []
+
+    # ── Header ──
+    story.append(Paragraph("🛡️ ChurnShield AI", title_style))
+    story.append(Paragraph("Customer Churn Prediction Report", sub_style))
+    story.append(HRFlowable(width="100%", thickness=1,
+                             color=rl_colors.HexColor("#a78bfa"), spaceAfter=12))
+
+    # ── Result Banner ──
+    result_style = ParagraphStyle("result", parent=styles["Normal"],
+                                   fontSize=16, fontName="Helvetica-Bold",
+                                   textColor=rl_colors.HexColor(risk_color),
+                                   alignment=TA_CENTER, spaceAfter=4)
+    prob_style   = ParagraphStyle("prob", parent=styles["Normal"],
+                                   fontSize=28, fontName="Helvetica-Bold",
+                                   textColor=rl_colors.HexColor(risk_color),
+                                   alignment=TA_CENTER, spaceAfter=12)
+    story.append(Paragraph(result_txt, result_style))
+    story.append(Paragraph(f"Churn Probability: {prob:.1%}", prob_style))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                             color=rl_colors.HexColor("#cccccc"), spaceAfter=10))
+
+    # ── Customer Profile ──
+    story.append(Paragraph("Customer Profile", h2_style))
+    profile_data = [
+        ["Field", "Value", "Field", "Value"],
+        ["Gender",          inputs["gender"],          "Senior Citizen",   "Yes" if inputs["SeniorCitizen"] else "No"],
+        ["Partner",         inputs["Partner"],          "Dependents",       inputs["Dependents"]],
+        ["Tenure",          f"{inputs['tenure']} months","Contract",        inputs["Contract"]],
+        ["Monthly Charges", f"${inputs['MonthlyCharges']:.2f}", "Total Charges", f"${inputs['TotalCharges']:.2f}"],
+        ["Internet Service",inputs["InternetService"],  "Phone Service",    inputs["PhoneService"]],
+        ["Payment Method",  inputs["PaymentMethod"],    "Paperless Billing",inputs["PaperlessBilling"]],
+        ["Online Security", inputs["OnlineSecurity"],   "Tech Support",     inputs["TechSupport"]],
+        ["Streaming TV",    inputs["StreamingTV"],      "Streaming Movies", inputs["StreamingMovies"]],
+    ]
+    tbl = Table(profile_data, colWidths=[3.8*cm, 4.2*cm, 3.8*cm, 4.2*cm])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",  (0,0), (-1,0), rl_colors.HexColor("#7c3aed")),
+        ("TEXTCOLOR",   (0,0), (-1,0), rl_colors.white),
+        ("FONTNAME",    (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE",    (0,0), (-1,0), 9),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1),
+         [rl_colors.HexColor("#f5f3ff"), rl_colors.white]),
+        ("FONTSIZE",    (0,1), (-1,-1), 9),
+        ("GRID",        (0,0), (-1,-1), 0.4, rl_colors.HexColor("#dddddd")),
+        ("FONTNAME",    (0,1), (0,-1), "Helvetica-Bold"),
+        ("FONTNAME",    (2,1), (2,-1), "Helvetica-Bold"),
+        ("VALIGN",      (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING",  (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 5),
+    ]))
+    story.append(tbl)
+    story.append(Spacer(1, 10))
+
+    # ── Risk Factors ──
+    story.append(Paragraph("Risk Analysis", h2_style))
+    if risk_factors:
+        story.append(Paragraph("<b>🔴 Churn-driving factors:</b>", body_style))
+        for f in risk_factors:
+            story.append(Paragraph(f"  • {f}", body_style))
+    if prot_factors:
+        story.append(Paragraph("<b>🟢 Retention-supporting factors:</b>", body_style))
+        for f in prot_factors:
+            story.append(Paragraph(f"  • {f}", body_style))
+    story.append(Spacer(1, 6))
+
+    # ── SHAP Top Features ──
+    story.append(Paragraph("SHAP Feature Importance (Top 10)", h2_style))
+    top_shap_idx = np.argsort(np.abs(shap_vals))[-10:][::-1]
+    shap_data = [["Feature", "SHAP Value", "Direction"]]
+    for i in top_shap_idx:
+        direction = "↑ Increases Risk" if shap_vals[i] > 0 else "↓ Decreases Risk"
+        shap_data.append([
+            FEATURE_COLS[i].replace("_", " "),
+            f"{shap_vals[i]:.4f}",
+            direction,
+        ])
+    shap_tbl = Table(shap_data, colWidths=[8*cm, 3.5*cm, 4.5*cm])
+    shap_tbl.setStyle(TableStyle([
+        ("BACKGROUND",  (0,0), (-1,0), rl_colors.HexColor("#0e7490")),
+        ("TEXTCOLOR",   (0,0), (-1,0), rl_colors.white),
+        ("FONTNAME",    (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE",    (0,0), (-1,-1), 9),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1),
+         [rl_colors.HexColor("#ecfeff"), rl_colors.white]),
+        ("GRID",        (0,0), (-1,-1), 0.4, rl_colors.HexColor("#dddddd")),
+        ("VALIGN",      (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING",  (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 5),
+    ]))
+    story.append(shap_tbl)
+    story.append(Spacer(1, 10))
+
+    # ── Recommendations ──
+    story.append(Paragraph("Recommended Actions", h2_style))
+    for icon, text in advice:
+        # Strip HTML tags for PDF
+        clean = text.replace("<b style='color:#a78bfa'>","").replace("<b style='color:#22d3ee'>","").replace("</b>","")
+        story.append(Paragraph(f"{icon}  {clean}", body_style))
+    story.append(Spacer(1, 10))
+
+    # ── Footer ──
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                             color=rl_colors.HexColor("#cccccc"), spaceBefore=10))
+    footer_style = ParagraphStyle("footer", parent=styles["Normal"],
+                                   fontSize=8, textColor=rl_colors.HexColor("#9d9abf"),
+                                   alignment=TA_CENTER)
+    story.append(Paragraph("Generated by ChurnShield AI · Powered by Logistic Regression + SHAP", footer_style))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+# ─── AI Voice Assistant ─────────────────────────────────────────────────────────
+def generate_voice_summary(prob: float, pred: int, risk_factors: list,
+                             prot_factors: list, advice: list,
+                             tenure: int, contract: str, monthly: float) -> bytes:
+    tier = ("critical" if prob >= .75 else "high" if prob >= .5
+            else "medium" if prob >= .3 else "low")
+
+    risk_txt = (", ".join(risk_factors[:3]) if risk_factors
+                else "no significant risk factors detected")
+    prot_txt = (", ".join(prot_factors[:2]) if prot_factors
+                else "no strong protective factors")
+
+    # Build clean advice text
+    advice_clean = []
+    for _, text in advice[:2]:
+        clean = (text.replace("<b style='color:#a78bfa'>","")
+                     .replace("<b style='color:#22d3ee'>","")
+                     .replace("</b>",""))
+        advice_clean.append(clean)
+
+    if pred == 1:
+        summary = (
+            f"Attention! This customer has a {prob:.0%} churn probability, "
+            f"placing them in the {tier} risk tier. "
+            f"The main churn-driving factors are: {risk_txt}. "
+            f"Protective factors include: {prot_txt}. "
+            f"The customer has been with us for {tenure} months "
+            f"on a {contract} contract, paying ${monthly:.0f} per month. "
+            f"Recommended actions: {'. '.join(advice_clean)}. "
+            f"Immediate retention intervention is advised."
+        )
+    else:
+        summary = (
+            f"Good news! This customer has only a {prob:.0%} churn probability, "
+            f"placing them in the {tier} risk tier. "
+            f"They appear to be a loyal customer with {tenure} months of tenure "
+            f"on a {contract} contract. "
+            f"Protective factors include: {prot_txt}. "
+            f"Consider offering a loyalty reward or upsell opportunity."
+        )
+
+    tts = gTTS(text=summary, lang="en", slow=False)
+    audio_buf = io.BytesIO()
+    tts.write_to_fp(audio_buf)
+    audio_buf.seek(0)
+    return audio_buf.read()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#                     NEW FEATURE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─── Login System ───────────────────────────────────────────────────────────────
+USERS = {
+    "admin":   hashlib.sha256("admin123".encode()).hexdigest(),
+    "analyst": hashlib.sha256("analyst2024".encode()).hexdigest(),
+    "demo":    hashlib.sha256("demo".encode()).hexdigest(),
+}
+
+def check_login(username: str, password: str) -> bool:
+    return USERS.get(username) == hashlib.sha256(password.encode()).hexdigest()
+
+def login_page():
+    st.markdown("""
+    <div style="display:flex;align-items:center;justify-content:center;min-height:60vh">
+    <div class="login-wrap">
+      <div style="text-align:center;font-size:3rem;margin-bottom:.5rem">🛡️</div>
+      <div class="login-title">ChurnShield AI</div>
+      <div class="login-sub">Sign in to access the intelligence platform</div>
+    </div></div>
+    """, unsafe_allow_html=True)
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        username = st.text_input("👤 Username", placeholder="admin / analyst / demo")
+        password = st.text_input("🔑 Password", type="password", placeholder="Enter password")
+        if st.button("🚀 Sign In", use_container_width=True):
+            if check_login(username, password):
+                st.session_state["logged_in"] = True
+                st.session_state["username"]   = username
+                st.rerun()
+            else:
+                st.error("❌ Invalid credentials. Try: admin / admin123  or  demo / demo")
+        st.markdown("""<div style="text-align:center;margin-top:1rem;font-size:.78rem;color:#9d9abf">
+          Demo: <b style="color:#a78bfa">admin</b>/admin123 &nbsp;|&nbsp;
+          <b style="color:#22d3ee">demo</b>/demo</div>""", unsafe_allow_html=True)
+
+
+if not st.session_state["logged_in"]:
+    login_page()
+    st.stop()
+
+
+# ─── Real-Time Simulation ────────────────────────────────────────────────────────
+def simulate_realtime_customers(n: int = 12) -> pd.DataFrame:
+    rng = np.random.default_rng(int(time.time()) % 99999)
+    contracts = ["Month-to-month", "One year", "Two year"]
+    internets = ["DSL", "Fiber optic", "No"]
+    payments  = ["Electronic check", "Mailed check", "Bank transfer", "Credit card"]
+    yn        = ["Yes", "No"]
+    rows = []
+    for i in range(n):
+        tenure  = int(rng.integers(1, 73))
+        monthly = round(float(rng.uniform(18, 120)), 2)
+        inp = dict(
+            SeniorCitizen=int(rng.integers(0,2)), tenure=tenure,
+            MonthlyCharges=monthly, TotalCharges=round(monthly*tenure,2),
+            gender=rng.choice(["Male","Female"]), Partner=rng.choice(yn),
+            Dependents=rng.choice(yn), PhoneService=rng.choice(yn),
+            MultipleLines=rng.choice(["No","Yes","No phone service"]),
+            InternetService=rng.choice(internets),
+            OnlineSecurity=rng.choice(["No","Yes","No internet service"]),
+            OnlineBackup=rng.choice(["No","Yes","No internet service"]),
+            DeviceProtection=rng.choice(["No","Yes","No internet service"]),
+            TechSupport=rng.choice(["No","Yes","No internet service"]),
+            StreamingTV=rng.choice(["No","Yes","No internet service"]),
+            StreamingMovies=rng.choice(["No","Yes","No internet service"]),
+            Contract=rng.choice(contracts), PaperlessBilling=rng.choice(yn),
+            PaymentMethod=rng.choice(payments),
+        )
+        try:
+            prob = float(model.predict_proba(encode_customer(inp))[0][1])
+        except Exception:
+            prob = 0.5
+        rows.append({
+            "Customer ID": f"SIM-{1000+i}",
+            "Tenure":      tenure,
+            "Monthly $":   monthly,
+            "Contract":    inp["Contract"][:12],
+            "Internet":    inp["InternetService"],
+            "Churn Prob %": round(prob*100, 1),
+            "Risk": ("🔴 Critical" if prob>=.75 else "🟠 High" if prob>=.5
+                     else "🟡 Medium" if prob>=.3 else "🟢 Low"),
+        })
+    return pd.DataFrame(rows).sort_values("Churn Prob %", ascending=False)
+
+
+# ─── Customer Segmentation ───────────────────────────────────────────────────────
+@st.cache_data
+def run_segmentation(_df, n_clusters=4):
+    feats = ["tenure","MonthlyCharges","TotalCharges"]
+    sub   = _df[feats].copy()
+    sub["TotalCharges"] = pd.to_numeric(sub["TotalCharges"], errors="coerce").fillna(0)
+    scaled = StandardScaler().fit_transform(sub)
+    labels = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit_predict(scaled)
+    result = _df.copy()
+    result["TotalCharges"] = pd.to_numeric(result["TotalCharges"], errors="coerce").fillna(0)
+    result["Segment"] = labels
+    return result
+
+SEG_META = {
+    0: {"name":"💎 Champions",     "color":"#22d3ee",
+        "desc":"Long tenure, high spend. Most loyal — reward them."},
+    1: {"name":"⚠️ At-Risk",       "color":"#f87171",
+        "desc":"Short tenure, high charges. Likely to churn soon."},
+    2: {"name":"🌱 New Customers", "color":"#a78bfa",
+        "desc":"Low tenure, low spend. Need onboarding attention."},
+    3: {"name":"⭐ High Value",     "color":"#fbbf24",
+        "desc":"Medium tenure, very high charges. Upsell & retain."},
+}
+
+def seg_scatter_3d(seg_df):
+    fig = go.Figure()
+    fallback_colors = ["#22d3ee", "#f87171", "#a78bfa", "#fbbf24", "#34d399", "#fb7185"]
+    for sid in sorted(seg_df["Segment"].unique()):
+        meta = SEG_META.get(int(sid), {
+            "name": f"Segment {int(sid) + 1}",
+            "color": fallback_colors[int(sid) % len(fallback_colors)],
+            "desc": "Data-driven customer cluster.",
+        })
+        mask = seg_df["Segment"] == sid
+        if not mask.any(): continue
+        fig.add_trace(go.Scatter3d(
+            x=seg_df[mask]["tenure"], y=seg_df[mask]["MonthlyCharges"],
+            z=seg_df[mask]["TotalCharges"], mode="markers", name=meta["name"],
+            marker=dict(size=5, color=meta["color"], opacity=0.8,
+                        line=dict(color="rgba(255,255,255,0.1)", width=0.5)),
+            hovertemplate=f"<b>{meta['name']}</b><br>Tenure:%{{x}}mo Monthly:$%{{y:.0f}}<extra></extra>",
+        ))
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(title=dict(text="Tenure (mo)"), backgroundcolor="rgba(3,7,18,0.8)",
+                       gridcolor="rgba(45,43,69,0.5)", showbackground=True, tickfont=dict(color="#9d9abf",size=9)),
+            yaxis=dict(title=dict(text="Monthly $"), backgroundcolor="rgba(3,7,18,0.8)",
+                       gridcolor="rgba(45,43,69,0.5)", showbackground=True, tickfont=dict(color="#9d9abf",size=9)),
+            zaxis=dict(title=dict(text="Total $"), backgroundcolor="rgba(3,7,18,0.8)",
+                       gridcolor="rgba(45,43,69,0.5)", showbackground=True, tickfont=dict(color="#9d9abf",size=9)),
+            bgcolor="rgba(3,7,18,0.9)", camera=dict(eye=dict(x=1.5,y=1.5,z=1.0)),
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(bgcolor="rgba(19,17,31,0.8)", bordercolor="rgba(124,58,237,0.3)",
+                    borderwidth=1, font=dict(color="#d4d0f0",size=11)),
+        margin=dict(t=10,b=10,l=0,r=0), height=460, font={"family":"Inter"},
+    )
+    return fig
+
+
+# ─── AI Recommendation Engine ────────────────────────────────────────────────────
+def ai_recommendations(prob: float, inputs: dict) -> list:
+    recs = []
+    tenure=inputs["tenure"]; contract=inputs["Contract"]
+    internet=inputs["InternetService"]; payment=inputs["PaymentMethod"]
+    monthly=inputs["MonthlyCharges"]; senior=inputs["SeniorCitizen"]
+    online_sec=inputs.get("OnlineSecurity","No"); tech_sup=inputs.get("TechSupport","No")
+
+    if contract == "Month-to-month":
+        recs.append({"priority":"🔴 High","action":"Contract Upgrade Offer",
+            "detail":"Offer 20% discount on annual plan. Month-to-month customers churn 3× more.",
+            "impact":"↓ 35% churn risk","color":"#f87171"})
+    if payment == "Electronic check":
+        recs.append({"priority":"🟠 Medium","action":"Auto-Pay Incentive",
+            "detail":"Offer $5/month credit for switching to bank transfer or credit card.",
+            "impact":"↓ 15% churn risk","color":"#fbbf24"})
+    if tenure < 6:
+        recs.append({"priority":"🔴 High","action":"Onboarding Campaign",
+            "detail":"Trigger 30-day onboarding sequence. First 6 months = highest churn window.",
+            "impact":"↓ 25% churn risk","color":"#f87171"})
+    if internet == "Fiber optic" and online_sec == "No":
+        recs.append({"priority":"🟠 Medium","action":"Security Bundle Upsell",
+            "detail":"Fiber users with Online Security churn 40% less. Offer free 3-month trial.",
+            "impact":"↓ 20% churn risk","color":"#fbbf24"})
+    if internet == "Fiber optic" and tech_sup == "No":
+        recs.append({"priority":"🟡 Low","action":"Tech Support Add-On",
+            "detail":"Proactively offer Tech Support — reduces frustration-driven churn.",
+            "impact":"↓ 12% churn risk","color":"#fde68a"})
+    if monthly > 80 and tenure < 24:
+        recs.append({"priority":"🔴 High","action":"Loyalty Discount",
+            "detail":f"High spend (${monthly:.0f}/mo) + low tenure = high risk. Offer 10% loyalty discount.",
+            "impact":"↓ 18% churn risk","color":"#f87171"})
+    if senior == 1:
+        recs.append({"priority":"🟡 Low","action":"Senior Care Program",
+            "detail":"Enroll in dedicated senior support with simplified billing.",
+            "impact":"↓ 10% churn risk","color":"#fde68a"})
+    if prob < 0.3:
+        recs.append({"priority":"🟢 Opportunity","action":"Upsell Premium Services",
+            "detail":"Low churn risk — ideal time to offer streaming bundles or device protection.",
+            "impact":"↑ Revenue opportunity","color":"#34d399"})
+    if not recs:
+        recs.append({"priority":"🟢 Good","action":"Maintain Engagement",
+            "detail":"Customer profile is healthy. Send quarterly satisfaction survey.",
+            "impact":"Maintain loyalty","color":"#34d399"})
+    return recs
+
+
+# ─── Batch Prediction ────────────────────────────────────────────────────────────
+def batch_predict(uploaded_df: pd.DataFrame) -> pd.DataFrame:
+    results = []
+    for _, row in uploaded_df.iterrows():
+        try:
+            tc = str(row.get("TotalCharges","0")).strip()
+            inp = dict(
+                SeniorCitizen=int(row.get("SeniorCitizen",0)),
+                tenure=float(row.get("tenure",12)),
+                MonthlyCharges=float(row.get("MonthlyCharges",65)),
+                TotalCharges=float(tc if tc else 0),
+                gender=str(row.get("gender","Male")),
+                Partner=str(row.get("Partner","No")),
+                Dependents=str(row.get("Dependents","No")),
+                PhoneService=str(row.get("PhoneService","Yes")),
+                MultipleLines=str(row.get("MultipleLines","No")),
+                InternetService=str(row.get("InternetService","DSL")),
+                OnlineSecurity=str(row.get("OnlineSecurity","No")),
+                OnlineBackup=str(row.get("OnlineBackup","No")),
+                DeviceProtection=str(row.get("DeviceProtection","No")),
+                TechSupport=str(row.get("TechSupport","No")),
+                StreamingTV=str(row.get("StreamingTV","No")),
+                StreamingMovies=str(row.get("StreamingMovies","No")),
+                Contract=str(row.get("Contract","Month-to-month")),
+                PaperlessBilling=str(row.get("PaperlessBilling","Yes")),
+                PaymentMethod=str(row.get("PaymentMethod","Electronic check")),
+            )
+            prob = float(model.predict_proba(encode_customer(inp))[0][1])
+            results.append({
+                "CustomerID":   row.get("customerID", f"ROW-{len(results)+1}"),
+                "Churn_Prob_%": round(prob*100,1),
+                "Prediction":   "Churn" if prob>=0.5 else "Stay",
+                "Risk_Tier":    ("Critical" if prob>=.75 else "High" if prob>=.5
+                                 else "Medium" if prob>=.3 else "Low"),
+                "Monthly_$":    row.get("MonthlyCharges",""),
+                "Tenure_mo":    row.get("tenure",""),
+                "Contract":     row.get("Contract",""),
+            })
+        except Exception as e:
+            results.append({"CustomerID":row.get("customerID","?"),
+                             "Churn_Prob_%":"Error","Prediction":str(e)[:40],
+                             "Risk_Tier":"","Monthly_$":"","Tenure_mo":"","Contract":""})
+    return pd.DataFrame(results)
+
+
+# ─── Alert System ────────────────────────────────────────────────────────────────
+def get_alerts() -> list:
+    alerts = []
+    mtm_churn  = (df[df["Contract"]=="Month-to-month"]["Churn"]=="Yes").mean()
+    fiber_churn= (df[df["InternetService"]=="Fiber optic"]["Churn"]=="Yes").mean()
+    new_churn  = (df[df["tenure"]<=6]["Churn"]=="Yes").mean()
+    overall    = (df["Churn"]=="Yes").mean()
+    if mtm_churn > 0.4:
+        alerts.append({"icon":"🔴","title":"High Month-to-Month Churn",
+            "msg":f"{mtm_churn:.0%} of month-to-month customers are churning. Launch contract upgrade campaign.",
+            "time":"Now","severity":"critical"})
+    if fiber_churn > 0.35:
+        alerts.append({"icon":"🟠","title":"Fiber Optic Segment Alert",
+            "msg":f"{fiber_churn:.0%} fiber customers churning. Check service quality & pricing.",
+            "time":"Today","severity":"high"})
+    if new_churn > 0.4:
+        alerts.append({"icon":"🟠","title":"New Customer Churn Risk",
+            "msg":f"{new_churn:.0%} of customers ≤6 months tenure are churning. Strengthen onboarding.",
+            "time":"Today","severity":"high"})
+    if overall > 0.25:
+        alerts.append({"icon":"🟡","title":"Overall Churn Rate Elevated",
+            "msg":f"Overall churn at {overall:.0%}. Industry benchmark is ~15-20%.",
+            "time":"This week","severity":"medium"})
+    alerts.append({"icon":"💡","title":"Opportunity: Electronic Check Users",
+        "msg":f"{(df['PaymentMethod']=='Electronic check').mean():.0%} customers use electronic check — highest churn payment method.",
+        "time":"Ongoing","severity":"info"})
+    return alerts
+
+
+# ─── Why Churn Happens ───────────────────────────────────────────────────────────
+WHY_CHURN = [
+    {"icon":"📋","title":"Month-to-Month Contracts","color":"#f87171",
+     "stat":"3× higher churn",
+     "desc":"No switching cost means customers can leave anytime. Annual contracts create commitment and reduce churn dramatically.",
+     "fix":"Offer discounted long-term contracts with added perks."},
+    {"icon":"💸","title":"High Monthly Charges","color":"#fbbf24",
+     "stat":"↑ Risk above $80/mo",
+     "desc":"Customers paying high fees without perceiving equivalent value shop competitors. Price sensitivity is highest in the first 12 months.",
+     "fix":"Bundle services to increase perceived value at same price point."},
+    {"icon":"🌐","title":"Fiber Optic Without Add-Ons","color":"#a78bfa",
+     "stat":"40% churn without security",
+     "desc":"Fiber customers pay premium but skip security/support add-ons. When issues arise, they have no safety net and churn out of frustration.",
+     "fix":"Proactively offer Online Security and Tech Support trials."},
+    {"icon":"💳","title":"Electronic Check Payment","color":"#f87171",
+     "stat":"Highest churn payment method",
+     "desc":"Electronic check users show the highest churn rates, possibly indicating lower engagement or financial instability.",
+     "fix":"Incentivize auto-pay with monthly bill credits."},
+    {"icon":"🚀","title":"Low Tenure (First 12 Months)","color":"#fbbf24",
+     "stat":"Highest churn window",
+     "desc":"The first year is the most critical retention period. Customers who haven't experienced full value are most likely to leave.",
+     "fix":"Implement structured 90-day onboarding with check-in calls."},
+    {"icon":"👴","title":"Senior Citizens","color":"#22d3ee",
+     "stat":"Higher churn vs non-seniors",
+     "desc":"Senior customers often struggle with complex billing and technical issues. Without dedicated support, frustration leads to churn.",
+     "fix":"Create a Senior Care program with a dedicated support line."},
+    {"icon":"📄","title":"Paperless Billing","color":"#a78bfa",
+     "stat":"Slightly higher churn",
+     "desc":"Paperless billing customers are more digitally engaged but also more price-aware and comparison-shop more actively online.",
+     "fix":"Send personalized digital retention offers to paperless customers."},
+    {"icon":"👥","title":"No Partner / No Dependents","color":"#34d399",
+     "stat":"More likely to churn",
+     "desc":"Single customers without dependents have more flexibility to switch providers. Family plans create switching costs.",
+     "fix":"Promote family/household bundle plans with shared benefits."},
+]
+
+def why_churn_chart():
+    factors = {
+        "Month-to-month": (df["Contract"]=="Month-to-month"),
+        "Fiber Optic":    (df["InternetService"]=="Fiber optic"),
+        "Elec. Check":    (df["PaymentMethod"]=="Electronic check"),
+        "Tenure ≤6mo":    (df["tenure"]<=6),
+        "Senior":         (df["SeniorCitizen"]==1),
+        "No Partner":     (df["Partner"]=="No"),
+        "Paperless":      (df["PaperlessBilling"]=="Yes"),
+        "Two Year":       (df["Contract"]=="Two year"),
+    }
+    names = list(factors.keys())
+    rates = [(df[m]["Churn"]=="Yes").mean()*100 for m in factors.values()]
+    colors= ["#f87171" if r>40 else "#fbbf24" if r>25 else "#34d399" for r in rates]
+    fig = go.Figure(go.Bar(
+        x=names, y=rates, marker=dict(color=colors, line=dict(color="rgba(0,0,0,0)")),
+        text=[f"{r:.0f}%" for r in rates], textposition="outside",
+        textfont=dict(color="#d4d0f0",size=11),
+        hovertemplate="%{x}<br>Churn Rate: %{y:.1f}%<extra></extra>",
+    ))
+    overall = (df["Churn"]=="Yes").mean()*100
+    fig.add_hline(y=overall, line_dash="dash", line_color="#a78bfa", line_width=1.5,
+                  annotation_text=f"Overall: {overall:.0f}%",
+                  annotation_font_color="#a78bfa", annotation_font_size=10)
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color":"#9d9abf","family":"Inter"},
+        xaxis=dict(gridcolor="rgba(45,43,69,0.3)"),
+        yaxis=dict(gridcolor="rgba(45,43,69,0.4)", title="Churn Rate %",
+                   range=[0, max(rates)+15]),
+        margin=dict(t=20,b=40,l=40,r=20), height=320,
+    )
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #                               SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
@@ -727,6 +1399,17 @@ with st.sidebar:
       <div style="font-size:.72rem;color:#9d9abf;margin-top:.2rem">Customer Intelligence Platform</div>
     </div>
     """, unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div style="font-size:.78rem;color:#9d9abf;text-align:center;margin-bottom:.8rem">
+      Signed in as <b style="color:#22d3ee">{st.session_state["username"]}</b>
+    </div>
+    """, unsafe_allow_html=True)
+    if st.button("Sign Out", use_container_width=True):
+        st.session_state["logged_in"] = False
+        st.session_state["username"] = ""
+        st.rerun()
 
     st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
 
@@ -764,7 +1447,9 @@ with st.sidebar:
         online_sec = online_bk = device_prot = tech_sup = stream_tv = stream_mov = "No internet service"
 
     st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
-    predict_btn = st.button("⚡ Predict Churn Risk", use_container_width=True)
+    if st.button("⚡ Predict Churn Risk", use_container_width=True):
+        st.session_state["run_prediction"] = True
+    predict_btn = st.session_state["run_prediction"]
 
     # Sidebar mini stats
     st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
@@ -861,7 +1546,15 @@ with k4:
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ── Tabs ──
-tab1, tab2, tab3 = st.tabs(["⚡  Prediction Engine", "🌐  3D Analytics", "🔬  Model Insights"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "⚡ Prediction",
+    "🤖 AI Engine",
+    "🌐 3D Analytics",
+    "👥 Segments",
+    "📊 Dashboard",
+    "📁 Batch CSV",
+    "❓ Why Churn",
+])
 
 
 # ══════════════════════════════════ TAB 1 ════════════════════════════════════════
@@ -886,6 +1579,7 @@ with tab1:
         coef    = model.coef_[0]
         vals    = X.values[0]
         contrib = coef * vals
+        shap_vals = np.zeros(len(FEATURE_COLS))  # default, updated after SHAP section
 
         pos_idx      = np.argsort(contrib)[-5:][::-1]
         neg_idx      = np.argsort(contrib)[:5]
@@ -897,7 +1591,7 @@ with tab1:
 
         with col_g:
             st.markdown('<div class="chart-3d-wrap">', unsafe_allow_html=True)
-            st.plotly_chart(gauge_3d(prob), use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(gauge_3d(prob), use_container_width=True, config={"displayModeBar": False}, key="prediction_gauge")
             st.markdown('</div>', unsafe_allow_html=True)
 
         with col_r:
@@ -981,8 +1675,117 @@ with tab1:
         st.markdown('<div class="section-header"><span class="section-icon">🌐</span><span class="section-title">3D Feature Impact Analysis</span></div>', unsafe_allow_html=True)
         st.markdown("<small style='color:#9d9abf'>Drag to rotate · Scroll to zoom · Hover for details</small>", unsafe_allow_html=True)
         st.markdown('<div class="chart-3d-wrap">', unsafe_allow_html=True)
-        st.plotly_chart(feature_impact_3d(X), use_container_width=True, config={"displayModeBar": True})
+        st.plotly_chart(feature_impact_3d(X), use_container_width=True, config={"displayModeBar": True}, key="prediction_feature_impact")
         st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── Row 3: SHAP | Voice | PDF ──
+        st.markdown("<br>", unsafe_allow_html=True)
+        shap_col, action_col = st.columns([2, 1])
+
+        with shap_col:
+            st.markdown("""
+            <div class="section-header">
+              <span class="section-icon">🤖</span>
+              <span class="section-title">SHAP Explainability</span>
+              <span style="font-size:.75rem;color:#9d9abf;margin-left:.5rem">
+                — Why did the model predict this?
+              </span>
+            </div>
+            """, unsafe_allow_html=True)
+            with st.spinner("Computing SHAP values..."):
+                X_background = df.copy()
+                # encode all rows for background
+                bg_rows = []
+                for _, row in X_background.iterrows():
+                    try:
+                        bg_rows.append(encode_customer({
+                            "SeniorCitizen": int(row["SeniorCitizen"]),
+                            "tenure": row["tenure"],
+                            "MonthlyCharges": row["MonthlyCharges"],
+                            "TotalCharges": row["TotalCharges"] if pd.notna(row["TotalCharges"]) else 0,
+                            "gender": row["gender"], "Partner": row["Partner"],
+                            "Dependents": row["Dependents"], "PhoneService": row["PhoneService"],
+                            "MultipleLines": row["MultipleLines"],
+                            "InternetService": row["InternetService"],
+                            "OnlineSecurity": row["OnlineSecurity"],
+                            "OnlineBackup": row["OnlineBackup"],
+                            "DeviceProtection": row["DeviceProtection"],
+                            "TechSupport": row["TechSupport"],
+                            "StreamingTV": row["StreamingTV"],
+                            "StreamingMovies": row["StreamingMovies"],
+                            "Contract": row["Contract"],
+                            "PaperlessBilling": row["PaperlessBilling"],
+                            "PaymentMethod": row["PaymentMethod"],
+                        }).values[0])
+                    except Exception:
+                        pass
+                X_bg = pd.DataFrame(bg_rows, columns=FEATURE_COLS)
+                fig_shap, shap_vals = shap_chart(X, X_bg)
+            st.markdown("""
+            <div style="background:rgba(34,211,238,0.05);border:1px solid rgba(34,211,238,0.2);
+                        border-radius:10px;padding:.6rem 1rem;margin-bottom:.6rem;font-size:.82rem;color:#9d9abf">
+              🔴 <b style="color:#f87171">Red bars</b> push prediction toward churn &nbsp;|&nbsp;
+              🔵 <b style="color:#22d3ee">Blue bars</b> push prediction away from churn &nbsp;|&nbsp;
+              <b style="color:#a78bfa">Dashed line</b> = base (average) prediction
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown('<div class="chart-3d-wrap">', unsafe_allow_html=True)
+            st.plotly_chart(fig_shap, use_container_width=True, config={"displayModeBar": False}, key="prediction_shap")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with action_col:
+            # ── Voice Assistant ──
+            st.markdown("""
+            <div class="section-header">
+              <span class="section-icon">🔊</span>
+              <span class="section-title">AI Voice Assistant</span>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("""
+            <div style="background:rgba(167,139,250,0.07);border:1px solid rgba(167,139,250,0.25);
+                        border-radius:12px;padding:1rem;margin-bottom:1rem;font-size:.85rem;color:#9d9abf;line-height:1.6">
+              Click below to hear an AI-generated voice summary of this prediction,
+              including risk tier, key factors, and recommended actions.
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button("🔊 Generate Voice Summary", use_container_width=True):
+                with st.spinner("Generating audio..."):
+                    audio_bytes = generate_voice_summary(
+                        prob, pred, risk_factors, prot_factors,
+                        advice, tenure, contract, monthly
+                    )
+                st.audio(audio_bytes, format="audio/mp3")
+                st.success("✅ Audio ready — press play above!")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # ── PDF Report ──
+            st.markdown("""
+            <div class="section-header">
+              <span class="section-icon">📄</span>
+              <span class="section-title">PDF Report</span>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("""
+            <div style="background:rgba(34,211,238,0.07);border:1px solid rgba(34,211,238,0.25);
+                        border-radius:12px;padding:1rem;margin-bottom:1rem;font-size:.85rem;color:#9d9abf;line-height:1.6">
+              Download a full PDF report with customer profile, risk analysis,
+              SHAP feature importance, and recommended actions.
+            </div>
+            """, unsafe_allow_html=True)
+            with st.spinner("Building PDF..."):
+                pdf_bytes = generate_pdf_report(
+                    inputs, prob, pred,
+                    risk_factors, prot_factors,
+                    advice, shap_vals
+                )
+            st.download_button(
+                label="📥 Download PDF Report",
+                data=pdf_bytes,
+                file_name=f"churnshield_report_{inputs.get('tenure','')}_mo.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
 
     else:
         st.markdown("""
@@ -997,16 +1800,116 @@ with tab1:
           <div class="feature-grid">
             <div class="feature-item"><div class="feature-item-icon">🎯</div><div class="feature-item-lbl">3D Gauge</div></div>
             <div class="feature-item"><div class="feature-item-icon">🌐</div><div class="feature-item-lbl">3D Impact</div></div>
-            <div class="feature-item"><div class="feature-item-icon">💡</div><div class="feature-item-lbl">AI Advice</div></div>
-            <div class="feature-item"><div class="feature-item-icon">🎯</div><div class="feature-item-lbl">Risk Tier</div></div>
-            <div class="feature-item"><div class="feature-item-icon">📊</div><div class="feature-item-lbl">Key Factors</div></div>
+            <div class="feature-item"><div class="feature-item-icon">🤖</div><div class="feature-item-lbl">SHAP AI</div></div>
+            <div class="feature-item"><div class="feature-item-icon">🔊</div><div class="feature-item-lbl">Voice AI</div></div>
+            <div class="feature-item"><div class="feature-item-icon">📄</div><div class="feature-item-lbl">PDF Report</div></div>
           </div>
         </div>
         """, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════ TAB 2 ════════════════════════════════════════
+# ══════════════════════════════════ TAB 2 — AI ENGINE ═══════════════════════════
 with tab2:
+    st.markdown('<div class="section-header"><span class="section-icon">🤖</span><span class="section-title">AI Recommendation Engine, Live Simulation & Alerts</span></div>', unsafe_allow_html=True)
+
+    current_inputs = dict(
+        SeniorCitizen=int(senior), tenure=tenure,
+        MonthlyCharges=monthly, TotalCharges=total,
+        gender=gender, Partner=partner, Dependents=dependents,
+        PhoneService=phone, MultipleLines=multi_lines,
+        InternetService=internet, OnlineSecurity=online_sec,
+        OnlineBackup=online_bk, DeviceProtection=device_prot,
+        TechSupport=tech_sup, StreamingTV=stream_tv,
+        StreamingMovies=stream_mov, Contract=contract,
+        PaperlessBilling=paperless, PaymentMethod=payment,
+    )
+    current_prob = float(model.predict_proba(encode_customer(current_inputs))[0][1])
+    recs = ai_recommendations(current_prob, current_inputs)
+
+    ai_col, live_col = st.columns([1.15, 1])
+    with ai_col:
+        st.markdown("""
+        <div style="background:rgba(124,58,237,0.06);border:1px solid rgba(124,58,237,0.2);
+                    border-radius:12px;padding:.8rem 1.2rem;margin-bottom:.8rem">
+          <b style="color:#22d3ee">Next Best Actions</b>
+          <span style="color:#9d9abf;font-size:.85rem;margin-left:.8rem">Personalized from the sidebar profile</span>
+        </div>
+        """, unsafe_allow_html=True)
+        for rec in recs:
+            st.markdown(f"""
+            <div class="why-card" style="border-left-color:{rec['color']}">
+              <div class="why-title" style="color:{rec['color']}">{rec['priority']} · {rec['action']}</div>
+              <div class="why-desc">{rec['detail']}</div>
+              <div style="font-size:.78rem;color:#d4d0f0;margin-top:.55rem">Expected impact: <b style="color:{rec['color']}">{rec['impact']}</b></div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with live_col:
+        st.markdown("""
+        <div style="background:rgba(52,211,153,0.06);border:1px solid rgba(52,211,153,0.2);
+                    border-radius:12px;padding:.8rem 1.2rem;margin-bottom:.8rem">
+          <b style="color:#34d399"><span class="live-dot"></span>Real-Time Data Simulation</b>
+          <span style="color:#9d9abf;font-size:.82rem;margin-left:.5rem">New synthetic customers each refresh</span>
+        </div>
+        """, unsafe_allow_html=True)
+        sim_count = st.slider("Customers in live feed", 5, 30, 12, key="sim_count")
+        if st.button("Refresh Live Feed", use_container_width=True):
+            st.session_state["last_sim_refresh"] = datetime.now().strftime("%H:%M:%S")
+        sim_df = simulate_realtime_customers(sim_count)
+        st.dataframe(
+            sim_df,
+            use_container_width=True,
+            height=360,
+            column_config={
+                "Churn Prob %": st.column_config.ProgressColumn(
+                    "Churn Prob %",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f%%",
+                )
+            },
+        )
+        st.caption(f"Last refresh: {st.session_state.get('last_sim_refresh', datetime.now().strftime('%H:%M:%S'))}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    alert_col, email_col = st.columns([1, 1])
+    with alert_col:
+        st.markdown('<div class="section-header"><span class="section-icon">🚨</span><span class="section-title">Alert System</span></div>', unsafe_allow_html=True)
+        for alert in get_alerts():
+            st.markdown(f"""
+            <div class="alert-item">
+              <span class="alert-icon">{alert['icon']}</span>
+              <div>
+                <div class="alert-body"><b>{alert['title']}</b><br>{alert['msg']}</div>
+                <div class="alert-time">{alert['time']} · {alert['severity'].title()}</div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with email_col:
+        st.markdown('<div class="section-header"><span class="section-icon">✉️</span><span class="section-title">Email / Alert Draft</span></div>', unsafe_allow_html=True)
+        recipient = st.text_input("Recipient", "retention-team@company.com")
+        subject = st.text_input("Subject", f"Churn Alert: {current_prob:.0%} risk customer")
+        email_body = (
+            f"Hi team,\n\n"
+            f"A customer profile is currently scoring {current_prob:.1%} churn risk.\n\n"
+            f"Recommended action: {recs[0]['action']}\n"
+            f"Why: {recs[0]['detail']}\n"
+            f"Expected impact: {recs[0]['impact']}\n\n"
+            f"Customer snapshot:\n"
+            f"- Tenure: {tenure} months\n"
+            f"- Contract: {contract}\n"
+            f"- Monthly charges: ${monthly:.2f}\n"
+            f"- Internet service: {internet}\n\n"
+            f"Please review and trigger the retention workflow."
+        )
+        st.text_area("Message", email_body, height=260)
+        if st.button("Simulate Sending Alert", use_container_width=True):
+            st.success(f"Alert queued for {recipient}. SMTP is simulated in this demo app.")
+
+
+# ══════════════════════════════════ TAB 3 — 3D Analytics ════════════════════════
+with tab3:
     st.markdown('<div class="section-header"><span class="section-icon">🌐</span><span class="section-title">3D Analytics Dashboard</span></div>', unsafe_allow_html=True)
 
     # ── 3D Scatter ──
@@ -1018,7 +1921,7 @@ with tab2:
     </div>
     """, unsafe_allow_html=True)
     st.markdown('<div class="chart-3d-wrap">', unsafe_allow_html=True)
-    st.plotly_chart(scatter_3d_churn(), use_container_width=True)
+    st.plotly_chart(scatter_3d_churn(), use_container_width=True, key="analytics_scatter_3d")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1034,7 +1937,7 @@ with tab2:
         </div>
         """, unsafe_allow_html=True)
         st.markdown('<div class="chart-3d-wrap">', unsafe_allow_html=True)
-        st.plotly_chart(risk_surface_3d(), use_container_width=True)
+        st.plotly_chart(risk_surface_3d(), use_container_width=True, key="analytics_risk_surface")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col_bubble:
@@ -1046,7 +1949,7 @@ with tab2:
         </div>
         """, unsafe_allow_html=True)
         st.markdown('<div class="chart-3d-wrap">', unsafe_allow_html=True)
-        st.plotly_chart(bar_3d_churn(), use_container_width=True)
+        st.plotly_chart(bar_3d_churn(), use_container_width=True, key="analytics_churn_bubble")
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1057,26 +1960,26 @@ with tab2:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Overall Churn Split**")
-        st.plotly_chart(churn_donut(), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(churn_donut(), use_container_width=True, config={"displayModeBar": False}, key="analytics_churn_donut")
     with c2:
         st.markdown("**Tenure Distribution by Churn**")
-        st.plotly_chart(tenure_hist(), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(tenure_hist(), use_container_width=True, config={"displayModeBar": False}, key="analytics_tenure_hist")
 
     c3, c4 = st.columns(2)
     with c3:
         st.markdown("**Churn by Contract Type**")
-        st.plotly_chart(churn_by_col("Contract", "Contract"), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(churn_by_col("Contract", "Contract"), use_container_width=True, config={"displayModeBar": False}, key="analytics_contract_churn")
     with c4:
         st.markdown("**Monthly Charges Distribution**")
-        st.plotly_chart(monthly_violin(), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(monthly_violin(), use_container_width=True, config={"displayModeBar": False}, key="analytics_monthly_violin")
 
     c5, c6 = st.columns(2)
     with c5:
         st.markdown("**Churn by Internet Service**")
-        st.plotly_chart(churn_by_col("InternetService", "Internet Service"), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(churn_by_col("InternetService", "Internet Service"), use_container_width=True, config={"displayModeBar": False}, key="analytics_internet_churn")
     with c6:
         st.markdown("**Churn by Payment Method**")
-        st.plotly_chart(churn_by_col("PaymentMethod", "Payment Method"), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(churn_by_col("PaymentMethod", "Payment Method"), use_container_width=True, config={"displayModeBar": False}, key="analytics_payment_churn")
 
     # Raw data
     with st.expander("🔎 Explore Raw Dataset"):
@@ -1086,8 +1989,120 @@ with tab2:
         st.caption(f"Showing {len(show_df):,} of {len(df):,} records")
 
 
-# ══════════════════════════════════ TAB 3 ════════════════════════════════════════
-with tab3:
+# ══════════════════════════════════ TAB 4 — CUSTOMER SEGMENTATION ══════════════
+with tab4:
+    st.markdown('<div class="section-header"><span class="section-icon">👥</span><span class="section-title">Customer Segmentation</span></div>', unsafe_allow_html=True)
+
+    cluster_count = st.slider("Number of customer segments", 3, 6, 4)
+    seg_df = run_segmentation(df, cluster_count)
+    seg_summary = (
+        seg_df.groupby("Segment")
+        .agg(
+            Customers=("customerID", "count"),
+            Churn_Rate=("Churn", lambda s: (s == "Yes").mean()),
+            Avg_Tenure=("tenure", "mean"),
+            Avg_Monthly=("MonthlyCharges", "mean"),
+            Avg_Total=("TotalCharges", "mean"),
+        )
+        .reset_index()
+    )
+
+    seg_cols = st.columns(min(cluster_count, 4))
+    for idx, row in seg_summary.iterrows():
+        meta = SEG_META.get(int(row["Segment"]), {
+            "name": f"Segment {int(row['Segment']) + 1}",
+            "color": "#a78bfa",
+            "desc": "Data-driven customer cluster.",
+        })
+        with seg_cols[idx % len(seg_cols)]:
+            st.markdown(f"""
+            <div class="seg-card" style="border-color:{meta['color']};background:rgba(19,17,31,0.55)">
+              <div class="seg-title" style="color:{meta['color']}">{meta['name']}</div>
+              <div class="seg-desc">{meta['desc']}</div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-top:.8rem;font-size:.78rem;color:#9d9abf">
+                <div>Customers<br><b style="color:#d4d0f0">{int(row['Customers'])}</b></div>
+                <div>Churn<br><b style="color:#f87171">{row['Churn_Rate']:.0%}</b></div>
+                <div>Tenure<br><b style="color:#d4d0f0">{row['Avg_Tenure']:.0f} mo</b></div>
+                <div>Monthly<br><b style="color:#d4d0f0">${row['Avg_Monthly']:.0f}</b></div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    left, right = st.columns([1.3, 1])
+    with left:
+        st.markdown('<div class="chart-3d-wrap">', unsafe_allow_html=True)
+        st.plotly_chart(seg_scatter_3d(seg_df), use_container_width=True, key="segments_scatter_3d")
+        st.markdown('</div>', unsafe_allow_html=True)
+    with right:
+        fig_seg = px.bar(
+            seg_summary,
+            x="Segment",
+            y="Churn_Rate",
+            color="Churn_Rate",
+            color_continuous_scale=["#22d3ee", "#fbbf24", "#f87171"],
+            text=seg_summary["Churn_Rate"].map(lambda x: f"{x:.0%}"),
+        )
+        fig_seg.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font={"color":"#9d9abf","family":"Inter"},
+            yaxis=dict(tickformat=".0%", gridcolor="rgba(45,43,69,0.5)", title="Churn Rate"),
+            xaxis=dict(gridcolor="rgba(45,43,69,0.2)", title="Segment"),
+            coloraxis_showscale=False,
+            margin=dict(t=20,b=40,l=40,r=20),
+            height=360,
+        )
+        st.plotly_chart(fig_seg, use_container_width=True, config={"displayModeBar": False}, key="segments_churn_bar")
+        st.dataframe(
+            seg_summary.assign(Churn_Rate=seg_summary["Churn_Rate"].map(lambda x: f"{x:.1%}")),
+            use_container_width=True,
+            height=220,
+        )
+
+
+# ══════════════════════════════════ TAB 5 — ADVANCED DASHBOARD ═════════════════
+with tab5:
+    st.markdown('<div class="section-header"><span class="section-icon">📊</span><span class="section-title">Advanced Dashboard</span></div>', unsafe_allow_html=True)
+
+    dash_a, dash_b, dash_c = st.columns(3)
+    with dash_a:
+        st.plotly_chart(churn_donut(), use_container_width=True, config={"displayModeBar": False}, key="dashboard_churn_donut")
+    with dash_b:
+        contract_rates = df.groupby("Contract")["Churn"].apply(lambda s: (s == "Yes").mean()).reset_index(name="Churn Rate")
+        fig_contract = px.bar(contract_rates, x="Contract", y="Churn Rate", color="Churn Rate",
+                              color_continuous_scale=["#22d3ee", "#fbbf24", "#f87171"],
+                              text=contract_rates["Churn Rate"].map(lambda x: f"{x:.0%}"))
+        fig_contract.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font={"color":"#9d9abf","family":"Inter"},
+            yaxis=dict(tickformat=".0%", gridcolor="rgba(45,43,69,0.5)"),
+            coloraxis_showscale=False, margin=dict(t=20,b=30,l=35,r=10), height=260)
+        st.plotly_chart(fig_contract, use_container_width=True, config={"displayModeBar": False}, key="dashboard_contract_rates")
+    with dash_c:
+        st.markdown('<div class="advice-glass"><div class="advice-title">🚨 Priority Alerts</div>', unsafe_allow_html=True)
+        for alert in get_alerts()[:4]:
+            st.markdown(f'<div class="advice-item"><span class="advice-dot">{alert["icon"]}</span><span>{alert["title"]}<br><small style="color:#9d9abf">{alert["msg"]}</small></span></div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    heat = df.pivot_table(index="Contract", columns="InternetService", values="Churn", aggfunc=lambda s: (s == "Yes").mean()).fillna(0)
+    fig_heat = go.Figure(go.Heatmap(
+        z=heat.values,
+        x=heat.columns,
+        y=heat.index,
+        colorscale=[[0, "#22d3ee"], [.5, "#fbbf24"], [1, "#f87171"]],
+        text=[[f"{v:.0%}" for v in row] for row in heat.values],
+        texttemplate="%{text}",
+        hovertemplate="Contract: %{y}<br>Internet: %{x}<br>Churn: %{z:.1%}<extra></extra>",
+    ))
+    fig_heat.update_layout(
+        title=dict(text="Churn Heatmap: Contract × Internet Service", font=dict(color="#d4d0f0", size=14)),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color":"#9d9abf","family":"Inter"},
+        margin=dict(t=55,b=35,l=80,r=20), height=360,
+    )
+    st.plotly_chart(fig_heat, use_container_width=True, config={"displayModeBar": False}, key="dashboard_heatmap")
+
     st.markdown('<div class="section-header"><span class="section-icon">🔬</span><span class="section-title">Model Architecture & Coefficients</span></div>', unsafe_allow_html=True)
 
     m1, m2, m3, m4 = st.columns(4)
@@ -1179,7 +2194,7 @@ with tab3:
         font={"family": "Inter"},
     )
     st.markdown('<div class="chart-3d-wrap">', unsafe_allow_html=True)
-    st.plotly_chart(fig_3d_coef, use_container_width=True)
+    st.plotly_chart(fig_3d_coef, use_container_width=True, key="dashboard_coef_3d")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1205,7 +2220,7 @@ with tab3:
         yaxis=dict(gridcolor="rgba(0,0,0,0)"),
         margin=dict(t=50, b=20, l=10, r=20), height=500,
     )
-    st.plotly_chart(fig_coef2d, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig_coef2d, use_container_width=True, config={"displayModeBar": False}, key="dashboard_coef_2d")
 
     st.markdown("""
     <div class="advice-glass">
@@ -1224,6 +2239,107 @@ with tab3:
       </div>
     </div>
     """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════ TAB 6 — BATCH CSV ═══════════════════════════
+with tab6:
+    st.markdown('<div class="section-header"><span class="section-icon">📁</span><span class="section-title">Upload CSV & Batch Prediction</span></div>', unsafe_allow_html=True)
+
+    sample_csv = df.head(20).to_csv(index=False).encode("utf-8")
+    info_l, info_r = st.columns([1, 1])
+    with info_l:
+        st.markdown("""
+        <div class="advice-glass">
+          <div class="advice-title">CSV Requirements</div>
+          <div class="advice-item"><span class="advice-dot">1</span><span>Use the same columns as the training data, including tenure, contract, payment method, and charges.</span></div>
+          <div class="advice-item"><span class="advice-dot">2</span><span>Missing optional fields are filled with safe defaults so a partial file can still be scored.</span></div>
+          <div class="advice-item"><span class="advice-dot">3</span><span>Download results as a CSV with churn probability, prediction, and risk tier.</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+    with info_r:
+        st.download_button(
+            "Download Sample CSV",
+            data=sample_csv,
+            file_name="churn_batch_sample.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    uploaded_file = st.file_uploader("Upload customer CSV", type=["csv"])
+    if uploaded_file is not None:
+        try:
+            uploaded_df = pd.read_csv(uploaded_file)
+            st.success(f"Loaded {len(uploaded_df):,} rows.")
+            with st.spinner("Scoring customers..."):
+                pred_df = batch_predict(uploaded_df)
+
+            b1, b2, b3, b4 = st.columns(4)
+            valid_probs = pd.to_numeric(pred_df["Churn_Prob_%"], errors="coerce")
+            with b1:
+                st.metric("Rows Scored", f"{len(pred_df):,}")
+            with b2:
+                st.metric("Avg Risk", f"{valid_probs.mean():.1f}%")
+            with b3:
+                st.metric("High/Critical", f"{pred_df['Risk_Tier'].isin(['High','Critical']).sum():,}")
+            with b4:
+                st.metric("Predicted Churn", f"{(pred_df['Prediction'] == 'Churn').sum():,}")
+
+            st.dataframe(
+                pred_df,
+                use_container_width=True,
+                height=420,
+                column_config={
+                    "Churn_Prob_%": st.column_config.ProgressColumn(
+                        "Churn Prob %",
+                        min_value=0,
+                        max_value=100,
+                        format="%.1f%%",
+                    )
+                },
+            )
+            st.download_button(
+                "Download Batch Predictions",
+                data=pred_df.to_csv(index=False).encode("utf-8"),
+                file_name="churn_batch_predictions.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        except Exception as exc:
+            st.error(f"Could not process this CSV: {exc}")
+    else:
+        st.info("Upload a customer CSV or download the sample template to test batch prediction.")
+
+
+# ══════════════════════════════════ TAB 7 — WHY CHURN ═══════════════════════════
+with tab7:
+    st.markdown('<div class="section-header"><span class="section-icon">❓</span><span class="section-title">Why Churn Happens</span></div>', unsafe_allow_html=True)
+
+    top_l, top_r = st.columns([1.15, 1])
+    with top_l:
+        st.plotly_chart(why_churn_chart(), use_container_width=True, config={"displayModeBar": False}, key="why_churn_chart")
+    with top_r:
+        st.markdown("""
+        <div class="advice-glass">
+          <div class="advice-title">How to Use This Section</div>
+          <div class="advice-item"><span class="advice-dot">🎯</span><span>Compare each churn factor against the overall churn baseline.</span></div>
+          <div class="advice-item"><span class="advice-dot">🛠️</span><span>Use the recommended fix cards below as ready-made retention playbooks.</span></div>
+          <div class="advice-item"><span class="advice-dot">📣</span><span>Turn the highest bars into alert rules and campaign audiences.</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    cols = st.columns(2)
+    for i, item in enumerate(WHY_CHURN):
+        with cols[i % 2]:
+            st.markdown(f"""
+            <div class="why-card" style="border-left-color:{item['color']}">
+              <div class="why-title" style="color:{item['color']}">{item['icon']} {item['title']} · {item['stat']}</div>
+              <div class="why-desc">{item['desc']}</div>
+              <div style="font-size:.82rem;color:#d4d0f0;margin-top:.65rem">
+                <b style="color:#22d3ee">Fix:</b> {item['fix']}
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 
 # ── Footer ──
